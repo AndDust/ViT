@@ -56,6 +56,9 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
+    """
+        x.shape : torch.Size([8, 3, 224, 224])
+    """
     def forward(self, x):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
@@ -63,6 +66,12 @@ class PatchEmbed(nn.Module):
 
         # flatten: [B, C, H, W] -> [B, C, HW]
         # transpose: [B, C, HW] -> [B, HW, C]
+        """
+        
+            self.proj(x).shape : torch.Size([8, 768, 14, 14])
+            self.proj(x).flatten(2).shape : torch.Size([8, 768, 196])
+            self.proj(x).flatten(2).transpose(1, 2).shape : torch.Size([8, 196, 768])
+        """
         x = self.proj(x).flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
@@ -82,22 +91,40 @@ class Attention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop_ratio)
+        """
+            此处就是concat后用来映射的Wo
+        """
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop_ratio)
 
     def forward(self, x):
         # [batch_size, num_patches + 1, total_embed_dim]
+        """
+            x.shape : torch.Size([8, 197, 768])
+        """
         B, N, C = x.shape
 
         # qkv(): -> [batch_size, num_patches + 1, 3 * total_embed_dim]
         # reshape: -> [batch_size, num_patches + 1, 3, num_heads, embed_dim_per_head]
         # permute: -> [3, batch_size, num_heads, num_patches + 1, embed_dim_per_head]
+        """
+            self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads) : torch.Size([8, 197, 3, 12, 64])
+            qkv : torch.Size([3, 8, 12, 197, 64])
+        """
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         # [batch_size, num_heads, num_patches + 1, embed_dim_per_head]
+        """
+            q.shape : torch.Size([8, 12, 197, 64])
+            k.shape : torch.Size([8, 12, 197, 64])
+            v.shape : torch.Size([8, 12, 197, 64])
+        """
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         # transpose: -> [batch_size, num_heads, embed_dim_per_head, num_patches + 1]
         # @: multiply -> [batch_size, num_heads, num_patches + 1, num_patches + 1]
+        """
+            attn.shape : torch.Size([8, 12, 197, 197])
+        """
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -105,7 +132,12 @@ class Attention(nn.Module):
         # @: multiply -> [batch_size, num_heads, num_patches + 1, embed_dim_per_head]
         # transpose: -> [batch_size, num_patches + 1, num_heads, embed_dim_per_head]
         # reshape: -> [batch_size, num_patches + 1, total_embed_dim]
+        """
+            x.shape : torch.Size([8, 197, 768])
+            这里的reshape操作就将head进行concat处理了
+        """
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        """通过Wo矩阵进行映射"""
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -162,6 +194,11 @@ class Block(nn.Module):
 
 
 class VisionTransformer(nn.Module):
+    """
+        depth ： block重复堆叠的个数
+        representation_size ： MLP Head中pre_Logits中全连接层的节点个数，如果为None,就不构建pre_Logits，MLP Head中就只有Linear
+        distilled这个参数不用管，这个是作者兼容搭建DeiT模型使用的
+    """
     def __init__(self, img_size=224, patch_size=16, in_c=3, num_classes=1000,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, qkv_bias=True,
                  qk_scale=None, representation_size=None, distilled=False, drop_ratio=0.,
@@ -197,12 +234,18 @@ class VisionTransformer(nn.Module):
         self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_c=in_c, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
+        """
+            以下都是可学习参数
+        """
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+
         self.pos_drop = nn.Dropout(p=drop_ratio)
 
+        # x.item() : 取出只有一个数值的tensor里面的数字
         dpr = [x.item() for x in torch.linspace(0, drop_path_ratio, depth)]  # stochastic depth decay rule
+
         self.blocks = nn.Sequential(*[
             Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                   drop_ratio=drop_ratio, attn_drop_ratio=attn_drop_ratio, drop_path_ratio=dpr[i],
